@@ -1,6 +1,8 @@
-import io
+import os
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -21,7 +23,7 @@ from backend.engine.sms_engine import process_incoming_sms
 
 app = FastAPI(title="FinPilot Decision Support Agent API", version="1.1.0")
 
-# Enable CORS for local development
+# Enable CORS for local and cloud development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -145,22 +147,14 @@ async def upload_statement(
 
 @app.post("/api/sms/analyze", response_model=SMSLogItem)
 def analyze_sms_endpoint(req: SMSProcessRequest):
-    """
-    Analyzes raw SMS text without storing state. Useful for instant preview.
-    """
     sms_item = process_incoming_sms(req.sms_text, req.sender or "BANK-SMS", req.timestamp)
     return sms_item
 
 @app.post("/api/sms/process")
 def process_sms_endpoint(req: SMSProcessRequest):
-    """
-    Receives incoming SMS payload (from Android listener or Paste SMS UI),
-    runs sanitization, scam detection, transaction extraction, duplicate check,
-    and records to financial ledger if verified.
-    """
     sms_item = process_incoming_sms(req.sms_text, req.sender or "BANK-SMS", req.timestamp)
     
-    # 1. Duplicate Protection Check
+    # Duplicate Protection Check
     is_duplicate = False
     for existing in state["sms_logs"]:
         if (existing.amount == sms_item.amount and 
@@ -179,7 +173,6 @@ def process_sms_endpoint(req: SMSProcessRequest):
 
     state["sms_logs"].append(sms_item)
 
-    # 2. If VERIFIED_TRANSACTION -> Auto-insert into FinPilot Financial Transactions
     if sms_item.status == "VERIFIED_TRANSACTION" and sms_item.amount > 0:
         tx_id = f"tx_sms_{sms_item.id}"
         tx_date = sms_item.date_processed[:10]
@@ -210,9 +203,6 @@ def process_sms_endpoint(req: SMSProcessRequest):
 
 @app.get("/api/sms/transactions")
 def get_sms_transactions():
-    """
-    Returns all processed SMS logs along with summary statistics.
-    """
     logs = state["sms_logs"]
     verified = [s for s in logs if s.status == "VERIFIED_TRANSACTION"]
     suspicious = [s for s in logs if s.status == "SUSPICIOUS"]
@@ -242,16 +232,10 @@ def get_sms_transactions():
 
 @app.get("/api/sms/suspicious")
 def get_suspicious_sms():
-    """
-    Returns only suspicious SMS items requiring user review.
-    """
     return [s for s in state["sms_logs"] if s.status == "SUSPICIOUS"]
 
 @app.post("/api/sms/confirm")
 def confirm_sms_endpoint(req: SMSConfirmRequest):
-    """
-    Allows user to manually approve a suspicious or unknown SMS into financial records, or reject it.
-    """
     sms_item = next((s for s in state["sms_logs"] if s.id == req.sms_id), None)
     if not sms_item:
         raise HTTPException(status_code=404, detail="SMS log item not found")
@@ -265,7 +249,6 @@ def confirm_sms_endpoint(req: SMSConfirmRequest):
         if req.override_merchant:
             sms_item.merchant = req.override_merchant
 
-        # Convert to financial transaction if not already added
         if not sms_item.associated_transaction_id and sms_item.amount > 0:
             tx_id = f"tx_sms_cfm_{sms_item.id}"
             tx_amount = -abs(sms_item.amount) if sms_item.type == "income" else abs(sms_item.amount)
@@ -303,11 +286,9 @@ def get_overview():
 
     committed_total = sum(s.amount for s in state["subscriptions"])
 
-    # Online vs Cash Spending breakdown
     online_spending = sum(t.amount for t in curr_txs if t.type == "expense" and t.payment_mode in ["UPI", "CARD", "BANK_TRANSFER"])
     cash_spending = sum(t.amount for t in curr_txs if t.type == "expense" and t.payment_mode in ["ATM", "CASH"])
 
-    # Monthly Cashflow chart data
     cashflow = []
     for m in ["2026-07", "2026-08", "2026-09"]:
         m_txs = [t for t in txs if t.date.startswith(m)]
@@ -315,7 +296,6 @@ def get_overview():
         exp = sum(t.amount for t in m_txs if t.type == "expense")
         cashflow.append({"month": m, "income": round(inc, 2), "expenses": round(exp, 2), "net": round(inc - exp, 2)})
 
-    # Top spending categories
     cat_map = {}
     for t in curr_txs:
         if t.type == "expense":
@@ -428,3 +408,18 @@ def get_monthly_report():
         period="September 2026"
     )
     return report
+
+# --- PRODUCTION STATIC FRONTEND SERVING ---
+# Serves React production dist build if present
+frontend_dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+if os.path.exists(frontend_dist):
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="static_assets")
+
+    @app.get("/{full_path:path}")
+    def serve_frontend(full_path: str):
+        if full_path.startswith("api"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        file_path = os.path.join(frontend_dist, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(frontend_dist, "index.html"))

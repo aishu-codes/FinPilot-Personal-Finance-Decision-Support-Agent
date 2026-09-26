@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: finpilot
+    env: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 8000
